@@ -1,3 +1,5 @@
+<img src="assets/icon.png" width="88" alt="">
+
 # tama-firmware
 
 Firmware for a physical Tama device: a button, a mic, a speaker, a socket. Talks to
