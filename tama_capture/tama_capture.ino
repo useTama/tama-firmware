@@ -19,6 +19,11 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
+// Plain 2-channel I2S, not TDM. The ES7210 is put in the vendor's NORMAL_I2S
+// mode by 0x11=0x60 + 0x12=0x00 (16-bit word length, TDM off), which emits
+// ADC1 as left and ADC2 as right in a 2-slot frame. A TDM rewrite was tried
+// first and was the wrong fix -- the real bug was the channel-count nibble in
+// register 0x08. See es7210Init().
 #include <driver/i2s.h>
 #include <esp_idf_version.h>
 #include <esp_heap_caps.h>
@@ -50,25 +55,21 @@ static constexpr int PIN_LCD_RST     = 17;
 static constexpr int PIN_VOLUME_DOWN = 39;
 static constexpr int PIN_VOLUME_UP   = 40;
 
+static constexpr uint8_t CST810_ADDR = 0x15;  // touch, used as a capture trigger
 static constexpr uint8_t ES8311_ADDR = 0x18;
 static constexpr uint8_t ES7210_ADDR = 0x40;
 
-// UNVERIFIED on real hardware, and it fails silently if wrong. hardware.md
-// trap 4: board.json claims the ES7210 runs at 24 kHz, while the proven
-// bring-up I2S config (and this one) clocks 16 kHz with MCLK = 256 x 16000.
-// Whisper wants 16 kHz. If the ADC is actually delivering 24 kHz while the
-// header below declares 16000, playback is 1.5x slow and pitched down, and the
-// transcript comes back as garbage that looks like a whisper problem rather
-// than a clock problem. Verify by recording a known-length phrase and checking
-// the audioSeconds the server reports against a stopwatch.
 static constexpr uint32_t AUDIO_SAMPLE_RATE = 16000;
-static constexpr uint32_t AUDIO_MCLK_HZ     = 4096000;  // 256 * 16kHz
-// Also unverified: the ES7210 is a 4-channel ADC whose MIC3 is a speaker
-// loopback for AEC. The proven self-test reads it as plain 2-channel
-// standard-I2S and its level meter worked, so 2 is the evidence-backed choice,
-// but which physical mics land in L and R is not established. If transcripts
-// come back polluted, this is a prime suspect.
-static constexpr int AUDIO_CHANNELS         = 2;        // I2S delivers L+R frames; server downmixes.
+
+static constexpr uint32_t AUDIO_MCLK_HZ = 4096000;  // 256 x 16 kHz, per the vendor clock table
+
+// In NORMAL_I2S mode the ES7210 sends ADC1 on the left slot and ADC2 on the
+// right. On this board those are the two physical MEMS mics (the schematic
+// shows both fed from MICBIAS12, ES7210 pin 24), and MIC3 -- the speaker
+// loopback used for echo cancellation -- is held powered down by 0x4c=0xff,
+// so nothing routes the speaker's own output into a recording. Both channels
+// are shipped and the server downmixes to mono.
+static constexpr int AUDIO_CHANNELS = 2;
 
 static constexpr int LCD_WIDTH  = 240;
 static constexpr int LCD_HEIGHT = 296;
@@ -78,6 +79,7 @@ static constexpr uint16_t COLOR_WHITE = 0xffff;
 static constexpr uint16_t COLOR_GREEN = 0x07e0;
 static constexpr uint16_t COLOR_RED   = 0xf800;
 static constexpr uint16_t COLOR_AMBER = 0xfd20;
+static constexpr uint16_t COLOR_GRAY  = 0x8410;
 
 static constexpr int MAX_RECORD_SECONDS = 8;
 static constexpr size_t RECORD_BUFFER_BYTES =
@@ -280,7 +282,22 @@ static bool es7210Init() {
   ok &= i2cWriteReg(ES7210_ADDR, 0x22, 0x0a);
   ok &= i2cWriteReg(ES7210_ADDR, 0x20, 0x0a);
   ok &= i2cWriteReg(ES7210_ADDR, 0x21, 0x2a);
-  ok &= i2cWriteReg(ES7210_ADDR, 0x08, 0x00);
+  // 0x08 is MODE_CFG. Bits [7:4] are the microphone channel count (0x10 = 2
+  // channels) and bit 0 is master/slave. The chip resets to 0x10, and every
+  // real driver changes only bit 0 via a read-modify-write
+  // (es7210_update_reg_bit(ES7210_MODE_CONFIG_REG08, 0x01, 0x00)) precisely so
+  // the channel-count nibble survives.
+  //
+  // The reference sketch writes a flat 0x00 here, which zeroes that nibble.
+  // There is no legal channel count of zero: it misconfigures the ADC's
+  // internal FS division, and the symptom is a stream where only 1 sample in 8
+  // is real (verified on hardware: exactly 12.5% non-zero with a 32-sample
+  // period, identical at 8/16/24/48 kHz). Speech survives as an envelope and a
+  // 120 Hz fundamental but is decimated past intelligibility, which is why
+  // whisper heard a buzzer.
+  //
+  // 0x10 = 2 microphone channels, slave mode (ESP32 drives the clocks).
+  ok &= i2cWriteReg(ES7210_ADDR, 0x08, 0x10);
   ok &= i2cWriteReg(ES7210_ADDR, 0x40, 0x43);
   ok &= i2cWriteReg(ES7210_ADDR, 0x41, 0x70);
   ok &= i2cWriteReg(ES7210_ADDR, 0x42, 0x70);
@@ -303,27 +320,24 @@ static bool es7210Init() {
 }
 
 static bool audioInit() {
-  // Amp enabled only for the codec init handshake, then dropped again below.
-  // This firmware never plays audio, and MIC3 on the ES7210 is a speaker
-  // loopback for AEC (SKILL.md section 1) — leaving a 3 W class-D amp live
-  // would idle its noise floor straight into the capture path, on a
-  // battery-powered device, for no benefit.
+  // No playback path in this firmware, so the 3 W class-D amp stays off rather
+  // than idling its noise floor near the mics on a battery device.
   pinMode(PIN_PA_CTRL, OUTPUT);
-  digitalWrite(PIN_PA_CTRL, HIGH);
+  digitalWrite(PIN_PA_CTRL, LOW);
 
   i2s_config_t cfg = {};
-  cfg.mode                 = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_TX | I2S_MODE_RX);
+  // RX only: the ESP32 is I2S master either way, so it still generates
+  // MCLK/BCLK/WS for the ES7210 to slave off.
+  cfg.mode                 = static_cast<i2s_mode_t>(I2S_MODE_MASTER | I2S_MODE_RX);
   cfg.sample_rate          = AUDIO_SAMPLE_RATE;
   cfg.bits_per_sample      = I2S_BITS_PER_SAMPLE_16BIT;
   cfg.channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT;
   cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
   cfg.intr_alloc_flags     = 0;
-  // The reference self-test used 4x128 frames = 32 ms of ring. That is enough
-  // for a tool whose loop does nothing else, but this firmware also repaints a
-  // screen and runs a network stack, and anything that stalls the loop past the
-  // ring length silently overwrites captured samples with no error surfaced
-  // (i2s_read cannot report an overrun). 8x256 frames = 128 ms buys real
-  // headroom for ~8 KB of DMA memory.
+  // 8 x 256 frames = 128 ms of ring. The reference used 4 x 128 (32 ms), which
+  // is fine for a tool that does nothing else, but this firmware also repaints
+  // a screen and runs a network stack, and i2s_read cannot report an overrun --
+  // samples would just vanish.
   cfg.dma_buf_count        = 8;
   cfg.dma_buf_len          = 256;
   cfg.use_apll             = false;
@@ -336,7 +350,7 @@ static bool audioInit() {
 #endif
   pins.bck_io_num   = PIN_I2S_BCLK;
   pins.ws_io_num    = PIN_I2S_LRCK;
-  pins.data_out_num = PIN_I2S_DOUT;
+  pins.data_out_num = I2S_PIN_NO_CHANGE;   // nothing to play
   pins.data_in_num  = PIN_I2S_DIN;
 
   i2s_driver_uninstall(I2S_NUM_0);
@@ -344,12 +358,11 @@ static bool audioInit() {
   if (i2s_set_pin(I2S_NUM_0, &pins) != ESP_OK) return false;
   i2s_zero_dma_buffer(I2S_NUM_0);
 
-  bool dac_ok = es8311Init();
-  bool adc_ok = es7210Init();
-  Serial.printf("ES8311 init: %s, ES7210 init: %s\n", dac_ok ? "ok" : "FAILED", adc_ok ? "ok" : "FAILED");
-
-  digitalWrite(PIN_PA_CTRL, LOW);  // amp back off — see comment at the top of this function
-  return adc_ok;  // only the mic path is load-bearing for capture
+  // Codec registers go in after the clocks exist, so the ES7210 sees a valid
+  // MCLK while configuring itself.
+  const bool adc_ok = es7210Init();
+  Serial.printf("ES7210 init: %s\n", adc_ok ? "ok" : "FAILED");
+  return adc_ok;
 }
 
 // ---------------------------------------------------------------- WAV framing
@@ -418,7 +431,8 @@ static uint32_t nextCaptureSeq() {
 static void drawIdle() {
   lcdFillScreen(COLOR_BLACK);
   lcdDrawTextCentered(120, "TAMA", COLOR_WHITE, COLOR_BLACK, 3);
-  lcdDrawTextCentered(170, "HOLD TO TALK", COLOR_AMBER, COLOR_BLACK, 1);
+  lcdDrawTextCentered(170, "HOLD SCREEN TO TALK", COLOR_AMBER, COLOR_BLACK, 1);
+  lcdDrawTextCentered(188, "OR ANY BUTTON", COLOR_GRAY, COLOR_BLACK, 1);
 }
 
 // Split in two on purpose: the full-screen clear and the static label are
@@ -447,34 +461,72 @@ static void drawResult() {
   lcdDrawTextCentered(140, resultLine, resultColor, COLOR_BLACK, 2);
 }
 
-// Active HIGH with an external pulldown on this board (SKILL.md Gotcha 4).
-static bool powerKeyPressed() { return digitalRead(PIN_POWER_KEY) == HIGH; }
+// Trigger detection.
+//
+// A pin probe on the real unit measured these resting levels, which decides
+// how each input must be read:
+//   GPIO 3  (power key) INPUT=0 PULLUP=0 PULLDOWN=0 -> held LOW externally,
+//                       so it is active HIGH. Confirms SKILL.md Gotcha 4 and
+//                       contradicts cheeko_hw_self_test.ino's button table.
+//   GPIO 39 (vol -)     INPUT=1 PULLUP=1 PULLDOWN=0 -> floating, so it needs
+//                       an internal pullup and reads LOW when pressed.
+//   GPIO 0  (BOOT)      same as 39. Often not exposed through the case.
+//   GPIO 40 (vol +)     INPUT=0 PULLUP=0 -> pinned LOW even against a pullup,
+//                       so "LOW means pressed" would fire constantly. NOT USED.
+//   GPIO 37             part of the octal PSRAM bus. Touching it boot-loops
+//                       the chip. NEVER read it.
+//
+// Accepting a screen tap as well, because touch is the one input verified
+// working end to end on this unit, and pressing the middle button produced
+// nothing -- suggesting it may not be wired to GPIO 3 here at all.
+static const char *lastTrigger = "none";
+
+static bool touchIsPressed() {
+  uint8_t d[5] = {};
+  Wire.beginTransmission(CST810_ADDR);
+  Wire.write(0x02);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(CST810_ADDR, (size_t)5) != 5) return false;
+  for (int i = 0; i < 5; ++i) d[i] = Wire.read();
+  return (d[0] & 0x0f) != 0;
+}
+
+static bool triggerPressed() {
+  if (digitalRead(PIN_POWER_KEY) == HIGH)   { lastTrigger = "PWRKEY g3";  return true; }
+  if (digitalRead(PIN_VOLUME_DOWN) == LOW)  { lastTrigger = "VOL- g39";   return true; }
+  if (digitalRead(PIN_BOOT_BUTTON) == LOW)  { lastTrigger = "BOOT g0";    return true; }
+  if (touchIsPressed())                     { lastTrigger = "TOUCH";      return true; }
+  return false;
+}
+
+static bool powerKeyPressed() { return triggerPressed(); }
 
 // Set once the button has been observed released, so one press produces
 // exactly one recording. See the Idle case in loop().
 static bool armed = true;
 
 static void startRecording() {
+  Serial.printf("recording started by: %s\n", lastTrigger);
   recordedBytes = 0;
   lastShownSec = -1;  // file-scope, so a previous sub-second capture cannot
                       // suppress the first timer paint of the next recording
   recordStartedAtMs = millis();
-  i2s_zero_dma_buffer(I2S_NUM_0);
+  i2s_zero_dma_buffer(I2S_NUM_0);   // drop stale room noise buffered while idle
   state = AppState::Recording;
   drawRecordingStatic();
   drawRecordingTimer(0);
 }
 
 static void continueRecording() {
-  size_t bytesRead = 0;
   size_t remaining = RECORD_BUFFER_BYTES - recordedBytes;
   if (remaining == 0) { stopRecordingAndSend(); return; }
 
-  // Keep each read well inside the DMA ring (128 ms) so a read never has to
-  // wait on samples that do not exist yet.
-  size_t chunk = min(remaining, (size_t)2048);
+  // Keep each read well inside the DMA ring so it never waits on samples that
+  // do not exist yet.
+  size_t bytesRead = 0;
+  const size_t chunk = min(remaining, (size_t)2048);
   if (i2s_read(I2S_NUM_0, recordBuffer + WAV_HEADER_BYTES + recordedBytes, chunk, &bytesRead,
-               pdMS_TO_TICKS(50)) == ESP_OK) {
+               pdMS_TO_TICKS(60)) == ESP_OK) {
     recordedBytes += bytesRead;
   }
 
@@ -589,7 +641,12 @@ void setup() {
   pinMode(PIN_POWER_OFF, OUTPUT);
   digitalWrite(PIN_POWER_OFF, LOW);
 
-  pinMode(PIN_POWER_KEY, INPUT);  // active HIGH, external pulldown already on the board
+  // Polarity per the pin probe documented above triggerPressed().
+  pinMode(PIN_POWER_KEY, INPUT);            // externally pulled low, active HIGH
+  pinMode(PIN_VOLUME_DOWN, INPUT_PULLUP);   // floating, so bias it high
+  pinMode(PIN_BOOT_BUTTON, INPUT_PULLUP);   // same
+  // GPIO 40 and GPIO 37 are deliberately never configured. See the comment
+  // above triggerPressed() for why touching either is a bad idea.
 
   SPI.begin(PIN_LCD_SCLK, -1, PIN_LCD_MOSI, PIN_LCD_CS);  // no MISO on this bus
   SPI.setFrequency(40000000);
@@ -619,18 +676,65 @@ void setup() {
   lcdFillScreen(COLOR_BLACK);
   lcdDrawTextCentered(140, "CONNECTING WIFI", COLOR_WHITE, COLOR_BLACK, 1);
   WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);   // clear any stored config from a previous build
+  delay(200);
+
+  // Prove what the radio can actually see before blaming the password. This is
+  // the difference between "wrong credentials" and "that network is not here",
+  // which look identical from a bare connect failure.
+  Serial.printf("looking for SSID \"%s\" (len %d)\n", WIFI_SSID, (int)strlen(WIFI_SSID));
+  const int found = WiFi.scanNetworks();
+  Serial.printf("scan found %d networks:\n", found);
+  bool targetVisible = false;
+  for (int i = 0; i < found; ++i) {
+    const String ssid = WiFi.SSID(i);
+    const bool isTarget = ssid.equals(WIFI_SSID);
+    if (isTarget) targetVisible = true;
+    Serial.printf("  %2d) rssi %4d ch %2d %s %s\n", i, WiFi.RSSI(i), WiFi.channel(i),
+                  ssid.c_str(), isTarget ? "  <-- TARGET" : "");
+  }
+  if (!targetVisible) {
+    Serial.printf("!! \"%s\" is NOT in range. 2.4 GHz only on this chip — a 5 GHz-only\n", WIFI_SSID);
+    Serial.println("!! network will never appear here.");
+  }
+  WiFi.scanDelete();
+
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   uint32_t wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 20000) delay(250);
+  wl_status_t st = WiFi.status();
+  while (st != WL_CONNECTED && millis() - wifiStart < 25000) {
+    delay(400);
+    st = WiFi.status();
+  }
 
-  if (WiFi.status() != WL_CONNECTED) {
+  if (st != WL_CONNECTED) {
+    // Name the status rather than printing a bare number nobody can look up
+    // from memory.
+    const char *why = "unknown";
+    switch (st) {
+      case WL_NO_SSID_AVAIL:   why = "network not found (SSID wrong or out of range)"; break;
+      case WL_CONNECT_FAILED:  why = "connect rejected (password almost certainly wrong)"; break;
+      case WL_CONNECTION_LOST: why = "connection lost mid-handshake"; break;
+      case WL_DISCONNECTED:    why = "disconnected (often a wrong password or WPA3-only AP)"; break;
+      case WL_IDLE_STATUS:     why = "still idle (association never started)"; break;
+      default: break;
+    }
+    Serial.printf("halting: WiFi did not connect. status=%d (%s)\n", (int)st, why);
+    Serial.printf("         target \"%s\" was %s in the scan above\n",
+                  WIFI_SSID, targetVisible ? "VISIBLE" : "NOT visible");
+
     lcdFillScreen(COLOR_BLACK);
-    lcdDrawTextCentered(140, "WIFI FAILED", COLOR_RED, COLOR_BLACK, 2);
-    Serial.println("halting: could not join WiFi, check secrets.h");
+    lcdDrawTextCentered(110, "WIFI FAILED", COLOR_RED, COLOR_BLACK, 2);
+    lcdDrawTextCentered(150, targetVisible ? "NET SEEN, AUTH FAILED" : "NETWORK NOT FOUND",
+                        COLOR_AMBER, COLOR_BLACK, 1);
+    char codeLine[24];
+    snprintf(codeLine, sizeof(codeLine), "STATUS %d", (int)st);
+    lcdDrawTextCentered(170, codeLine, COLOR_WHITE, COLOR_BLACK, 1);
     while (true) delay(1000);
   }
 
-  Serial.printf("WiFi connected, IP: %s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("WiFi connected, IP: %s, RSSI %d\n",
+                WiFi.localIP().toString().c_str(), WiFi.RSSI());
   drawIdle();
 }
 
