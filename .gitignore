@@ -2,3 +2,4 @@ build/
 *.bin
 secrets.h
 .DS_Store
+backups/

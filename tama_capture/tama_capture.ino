@@ -18,6 +18,7 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
 #include <driver/i2s.h>
 #include <esp_idf_version.h>
 #include <esp_heap_caps.h>
@@ -52,8 +53,21 @@ static constexpr int PIN_VOLUME_UP   = 40;
 static constexpr uint8_t ES8311_ADDR = 0x18;
 static constexpr uint8_t ES7210_ADDR = 0x40;
 
+// UNVERIFIED on real hardware, and it fails silently if wrong. hardware.md
+// trap 4: board.json claims the ES7210 runs at 24 kHz, while the proven
+// bring-up I2S config (and this one) clocks 16 kHz with MCLK = 256 x 16000.
+// Whisper wants 16 kHz. If the ADC is actually delivering 24 kHz while the
+// header below declares 16000, playback is 1.5x slow and pitched down, and the
+// transcript comes back as garbage that looks like a whisper problem rather
+// than a clock problem. Verify by recording a known-length phrase and checking
+// the audioSeconds the server reports against a stopwatch.
 static constexpr uint32_t AUDIO_SAMPLE_RATE = 16000;
 static constexpr uint32_t AUDIO_MCLK_HZ     = 4096000;  // 256 * 16kHz
+// Also unverified: the ES7210 is a 4-channel ADC whose MIC3 is a speaker
+// loopback for AEC. The proven self-test reads it as plain 2-channel
+// standard-I2S and its level meter worked, so 2 is the evidence-backed choice,
+// but which physical mics land in L and R is not established. If transcripts
+// come back polluted, this is a prime suspect.
 static constexpr int AUDIO_CHANNELS         = 2;        // I2S delivers L+R frames; server downmixes.
 
 static constexpr int LCD_WIDTH  = 240;
@@ -96,15 +110,28 @@ static void lcdSetWindow(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1) {
   lcdWriteCommand(0x2c);
 }
 
+// Bulk-write in row-sized chunks rather than two SPI.write() calls per pixel.
+// A full screen is 71,040 pixels; per-pixel writes made lcdFillScreen take
+// hundreds of milliseconds, which is long enough to overrun the I2S capture
+// ring mid-recording and punch holes in the audio. SKILL.md section 4 says the
+// same thing ("SPI.writeBytes(buf, n) is far faster than a per-pixel loop").
 static void lcdFillRect(int x, int y, int w, int h, uint16_t color) {
   if (x < 0 || y < 0 || x >= LCD_WIDTH || y >= LCD_HEIGHT) return;
   w = min(w, LCD_WIDTH - x);
   h = min(h, LCD_HEIGHT - y);
   if (w <= 0 || h <= 0) return;
+
+  static uint8_t rowBuf[LCD_WIDTH * 2];
+  const int span = min(w, LCD_WIDTH);
+  for (int i = 0; i < span; ++i) {
+    rowBuf[i * 2]     = color >> 8;
+    rowBuf[i * 2 + 1] = color & 0xff;
+  }
+
   lcdSetWindow(x, y, x + w - 1, y + h - 1);
   digitalWrite(PIN_LCD_DC, HIGH);
   digitalWrite(PIN_LCD_CS, LOW);
-  for (int i = 0; i < w * h; ++i) { SPI.write(color >> 8); SPI.write(color & 0xff); }
+  for (int row = 0; row < h; ++row) SPI.writeBytes(rowBuf, span * 2);
   digitalWrite(PIN_LCD_CS, HIGH);
 }
 
@@ -140,9 +167,14 @@ static const uint8_t *glyphForChar(char c) {
   if (c >= 'a' && c <= 'z') return glyphs[1 + c - 'a'];
   if (c >= '0' && c <= '9') return glyphs[27 + c - '0'];
   switch (c) {
-    case ' ': return glyphs[0];  case '.': return glyphs[39];
-    case '-': return glyphs[40]; case ':': return glyphs[41];
-    case '!': return glyphs[42]; default:  return glyphs[0];
+    case ' ': return glyphs[0];
+    case '/': return glyphs[37];
+    case '_': return glyphs[38];
+    case '.': return glyphs[39];
+    case '-': return glyphs[40];
+    case ':': return glyphs[41];
+    default:  return glyphs[0];  // unmapped punctuation renders blank, not as
+                                 // some unrelated glyph
   }
 }
 
@@ -157,9 +189,17 @@ static void lcdDrawChar(int x, int y, char c, uint16_t color, uint16_t bg, int s
 }
 
 static void lcdDrawTextCentered(int y, const char *text, uint16_t color, uint16_t bg, int scale) {
-  int width = strlen(text) * 6 * scale;
-  int x = (LCD_WIDTH - width) / 2;
-  while (*text) { lcdDrawChar(x, y, *text, color, bg, scale); x += 6 * scale; ++text; }
+  // Truncate to what actually fits rather than letting x go negative — every
+  // lcdFillRect below would then hit its x<0 guard and the whole line would
+  // render as blank screen with no hint anything was wrong.
+  const int charW = 6 * scale;
+  const int maxChars = LCD_WIDTH / charW;
+  int len = (int)strlen(text);
+  if (len > maxChars) len = maxChars;
+
+  int x = (LCD_WIDTH - len * charW) / 2;
+  if (x < 0) x = 0;
+  for (int i = 0; i < len; ++i) { lcdDrawChar(x, y, text[i], color, bg, scale); x += charW; }
 }
 
 static void lcdInit() {
@@ -263,6 +303,11 @@ static bool es7210Init() {
 }
 
 static bool audioInit() {
+  // Amp enabled only for the codec init handshake, then dropped again below.
+  // This firmware never plays audio, and MIC3 on the ES7210 is a speaker
+  // loopback for AEC (SKILL.md section 1) — leaving a 3 W class-D amp live
+  // would idle its noise floor straight into the capture path, on a
+  // battery-powered device, for no benefit.
   pinMode(PIN_PA_CTRL, OUTPUT);
   digitalWrite(PIN_PA_CTRL, HIGH);
 
@@ -273,8 +318,14 @@ static bool audioInit() {
   cfg.channel_format       = I2S_CHANNEL_FMT_RIGHT_LEFT;
   cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
   cfg.intr_alloc_flags     = 0;
-  cfg.dma_buf_count        = 4;
-  cfg.dma_buf_len          = 128;
+  // The reference self-test used 4x128 frames = 32 ms of ring. That is enough
+  // for a tool whose loop does nothing else, but this firmware also repaints a
+  // screen and runs a network stack, and anything that stalls the loop past the
+  // ring length silently overwrites captured samples with no error surfaced
+  // (i2s_read cannot report an overrun). 8x256 frames = 128 ms buys real
+  // headroom for ~8 KB of DMA memory.
+  cfg.dma_buf_count        = 8;
+  cfg.dma_buf_len          = 256;
   cfg.use_apll             = false;
   cfg.tx_desc_auto_clear   = true;
   cfg.fixed_mclk           = AUDIO_MCLK_HZ;
@@ -296,6 +347,8 @@ static bool audioInit() {
   bool dac_ok = es8311Init();
   bool adc_ok = es7210Init();
   Serial.printf("ES8311 init: %s, ES7210 init: %s\n", dac_ok ? "ok" : "FAILED", adc_ok ? "ok" : "FAILED");
+
+  digitalWrite(PIN_PA_CTRL, LOW);  // amp back off — see comment at the top of this function
   return adc_ok;  // only the mic path is load-bearing for capture
 }
 
@@ -339,10 +392,28 @@ static AppState state = AppState::Idle;
 static constexpr size_t WAV_HEADER_BYTES = 44;
 static uint8_t *recordBuffer = nullptr;   // PSRAM: WAV_HEADER_BYTES + RECORD_BUFFER_BYTES
 static size_t recordedBytes = 0;
-static uint32_t recordEndedAtMs = 0;
+static uint32_t recordStartedAtMs = 0;
 static uint32_t resultShownAtMs = 0;
 static char resultLine[40] = "";
 static uint16_t resultColor = COLOR_WHITE;
+static int lastShownSec = -1;
+
+// Idempotency keys must stay unique across power cycles, and this board has a
+// one-key on/off switch so power cycling is routine, not rare. millis() alone
+// resets to 0 every boot: two captures taken at a similar offset after two
+// different boots would collide, and the server would replay the first note's
+// response while silently discarding the second recording (tama-server's
+// idempotency.ts treats a seen key as a duplicate by design). A counter in NVS
+// survives reboot and OTA, so every capture this device ever makes gets its own
+// key.
+static Preferences prefs;
+static uint32_t captureSeq = 0;
+
+static uint32_t nextCaptureSeq() {
+  captureSeq = prefs.getUInt("seq", 0) + 1;
+  prefs.putUInt("seq", captureSeq);
+  return captureSeq;
+}
 
 static void drawIdle() {
   lcdFillScreen(COLOR_BLACK);
@@ -350,11 +421,19 @@ static void drawIdle() {
   lcdDrawTextCentered(170, "HOLD TO TALK", COLOR_AMBER, COLOR_BLACK, 1);
 }
 
-static void drawRecording(int elapsedSec) {
+// Split in two on purpose: the full-screen clear and the static label are
+// drawn once when recording starts, and each per-second tick repaints only the
+// small timer strip. A full repaint every second is long enough to overrun the
+// I2S ring and drop audio, which is the one thing this device must not do.
+static void drawRecordingStatic() {
   lcdFillScreen(COLOR_BLACK);
   lcdDrawTextCentered(120, "RECORDING", COLOR_RED, COLOR_BLACK, 2);
+}
+
+static void drawRecordingTimer(int elapsedSec) {
   char line[16];
-  snprintf(line, sizeof(line), "%ds / %ds", elapsedSec, MAX_RECORD_SECONDS);
+  snprintf(line, sizeof(line), "%ds OF %ds", elapsedSec, MAX_RECORD_SECONDS);
+  lcdFillRect(0, 160, LCD_WIDTH, 8, COLOR_BLACK);  // just the timer strip
   lcdDrawTextCentered(160, line, COLOR_WHITE, COLOR_BLACK, 1);
 }
 
@@ -368,12 +447,22 @@ static void drawResult() {
   lcdDrawTextCentered(140, resultLine, resultColor, COLOR_BLACK, 2);
 }
 
+// Active HIGH with an external pulldown on this board (SKILL.md Gotcha 4).
 static bool powerKeyPressed() { return digitalRead(PIN_POWER_KEY) == HIGH; }
+
+// Set once the button has been observed released, so one press produces
+// exactly one recording. See the Idle case in loop().
+static bool armed = true;
 
 static void startRecording() {
   recordedBytes = 0;
+  lastShownSec = -1;  // file-scope, so a previous sub-second capture cannot
+                      // suppress the first timer paint of the next recording
+  recordStartedAtMs = millis();
   i2s_zero_dma_buffer(I2S_NUM_0);
   state = AppState::Recording;
+  drawRecordingStatic();
+  drawRecordingTimer(0);
 }
 
 static void continueRecording() {
@@ -381,15 +470,16 @@ static void continueRecording() {
   size_t remaining = RECORD_BUFFER_BYTES - recordedBytes;
   if (remaining == 0) { stopRecordingAndSend(); return; }
 
-  size_t chunk = min(remaining, (size_t)4096);
+  // Keep each read well inside the DMA ring (128 ms) so a read never has to
+  // wait on samples that do not exist yet.
+  size_t chunk = min(remaining, (size_t)2048);
   if (i2s_read(I2S_NUM_0, recordBuffer + WAV_HEADER_BYTES + recordedBytes, chunk, &bytesRead,
                pdMS_TO_TICKS(50)) == ESP_OK) {
     recordedBytes += bytesRead;
   }
 
   int elapsedSec = recordedBytes / (AUDIO_SAMPLE_RATE * AUDIO_CHANNELS * sizeof(int16_t));
-  static int lastShownSec = -1;
-  if (elapsedSec != lastShownSec) { drawRecording(elapsedSec); lastShownSec = elapsedSec; }
+  if (elapsedSec != lastShownSec) { drawRecordingTimer(elapsedSec); lastShownSec = elapsedSec; }
 
   if (!powerKeyPressed() || recordedBytes >= RECORD_BUFFER_BYTES) {
     stopRecordingAndSend();
@@ -405,7 +495,6 @@ static void showResult(const char *text, uint16_t color) {
 }
 
 static void stopRecordingAndSend() {
-  recordEndedAtMs = millis();
   state = AppState::Sending;
   drawSending();
 
@@ -420,32 +509,74 @@ static void stopRecordingAndSend() {
   writeWavHeader(recordBuffer, recordedBytes, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS);
   size_t totalLen = WAV_HEADER_BYTES + recordedBytes;
 
-  HTTPClient http;
-  String url = String("http://") + TAMA_SERVER_HOST + ":" + String(TAMA_SERVER_PORT) + "/capture";
-  http.begin(url);
-  http.addHeader("Content-Type", "audio/wav");
-  http.addHeader("Authorization", String("Bearer ") + TAMA_DEVICE_TOKEN);
+  // One key for this recording, reused across every retry below. That is the
+  // whole point of the header: a retry after a lost response must replay, not
+  // write a second note.
+  char idemKey[64];
+  snprintf(idemKey, sizeof(idemKey), "%s-%lu", WiFi.macAddress().c_str(),
+           (unsigned long)nextCaptureSeq());
 
-  char idemKey[48];
-  snprintf(idemKey, sizeof(idemKey), "%s-%lu", WiFi.macAddress().c_str(), (unsigned long)recordEndedAtMs);
-  http.addHeader("Idempotency-Key", idemKey);
+  // tama-server's documented retry policy (README "Client retry policy"):
+  // 401 -> stop, never retry. 413/422 -> drop, tell the user. 429/503/5xx and
+  // timeouts -> retry with backoff, same key. Anything 2xx -> done.
+  const int MAX_ATTEMPTS = 4;
+  int backoffMs = 400;
+  int httpCode = 0;
 
-  // No RTC on this board — tell the server how old the recording is instead
-  // of pretending to know the wall-clock time (architecture.md section 6).
-  http.addHeader("X-Tama-Captured-Age-Ms", "0");
+  for (int attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt) {
+    HTTPClient http;
+    String url = String("http://") + TAMA_SERVER_HOST + ":" + String(TAMA_SERVER_PORT) + "/capture";
+    http.begin(url);
+    http.setTimeout(20000);  // whisper transcription happens inside this request
+    http.addHeader("Content-Type", "audio/wav");
+    http.addHeader("Authorization", String("Bearer ") + TAMA_DEVICE_TOKEN);
+    http.addHeader("Idempotency-Key", idemKey);
 
-  int httpCode = http.POST(recordBuffer, totalLen);
-  Serial.printf("POST /capture -> %d\n", httpCode);
-  if (httpCode == 200) {
-    showResult("SAVED", COLOR_GREEN);
-  } else if (httpCode > 0) {
+    // No RTC on this board — send how long ago the speech happened rather than
+    // pretending to know wall-clock time. Measured from the START of the
+    // recording and evaluated per attempt, so upload and retry time do not
+    // push the note into the wrong day (architecture.md section 4, bug 1).
+    http.addHeader("X-Tama-Captured-Age-Ms", String((unsigned long)(millis() - recordStartedAtMs)));
+
+    httpCode = http.POST(recordBuffer, totalLen);
+    Serial.printf("POST /capture attempt %d -> %d\n", attempt, httpCode);
+
+    if (httpCode == 200) {
+      String body = http.getString();
+      Serial.printf("  %s\n", body.c_str());
+      http.end();
+      showResult("SAVED", COLOR_GREEN);
+      return;
+    }
+
+    // Terminal: retrying cannot help and would only burn battery.
+    if (httpCode == 401) { http.end(); showResult("UNAUTHORIZED", COLOR_RED); return; }
+    if (httpCode == 413) { http.end(); showResult("TOO LARGE", COLOR_RED); return; }
+    if (httpCode == 422) { http.end(); showResult("NO SPEECH", COLOR_AMBER); return; }
+
+    http.end();
+
+    if (attempt < MAX_ATTEMPTS) {
+      char line[24];
+      snprintf(line, sizeof(line), "RETRY %d", attempt + 1);
+      lcdFillRect(0, 180, LCD_WIDTH, 8, COLOR_BLACK);
+      lcdDrawTextCentered(180, line, COLOR_AMBER, COLOR_BLACK, 1);
+      delay(backoffMs);
+      backoffMs *= 2;
+    }
+  }
+
+  // Out of attempts. The recording is genuinely lost here — a flash-backed
+  // queue that survives this is real work and belongs in v2's offline-queue
+  // story (hardware.md), not bolted on now. Say so on screen rather than
+  // showing a green SAVED that did not happen.
+  if (httpCode > 0) {
     char line[24];
-    snprintf(line, sizeof(line), "ERROR %d", httpCode);
+    snprintf(line, sizeof(line), "FAILED %d", httpCode);
     showResult(line, COLOR_RED);
   } else {
     showResult("NO CONNECTION", COLOR_RED);
   }
-  http.end();
 }
 
 // ---------------------------------------------------------------- setup/loop
@@ -467,6 +598,8 @@ void setup() {
   lcdDrawTextCentered(140, "BOOTING...", COLOR_WHITE, COLOR_BLACK, 2);
 
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, 400000);
+
+  prefs.begin("tama", false);  // NVS namespace for the capture sequence counter
 
   if (!audioInit()) {
     lcdFillScreen(COLOR_BLACK);
@@ -504,7 +637,15 @@ void setup() {
 void loop() {
   switch (state) {
     case AppState::Idle:
-      if (powerKeyPressed()) startRecording();
+      // Require a real press edge: the button must have been seen released
+      // since the last capture. Without this, holding past the 8 s cap ends
+      // one recording and immediately starts another, chopping a single
+      // utterance into several notes with the upload window cut out of each.
+      if (powerKeyPressed()) {
+        if (armed) { armed = false; startRecording(); }
+      } else {
+        armed = true;
+      }
       delay(10);
       break;
     case AppState::Recording:
