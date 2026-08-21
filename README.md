@@ -1,4 +1,4 @@
-<img src="assets/icon.png" width="88" alt="">
+<img src="https://raw.githubusercontent.com/useTama/tama-firmware/main/assets/icon.png" width="88" alt="">
 
 # tama-firmware
 
